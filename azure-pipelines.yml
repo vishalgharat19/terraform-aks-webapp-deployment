@@ -14,11 +14,11 @@ variables:
 steps:
 
 # ============================================================
-# 1. Install tools, authenticate and connect to AKS
+# 1. Verify Azure Authentication and Subscription
 # ============================================================
 
 - task: AzureCLI@2
-  displayName: 'Connect to AKS and deploy application'
+  displayName: 'Verify Azure Authentication'
 
   inputs:
     azureSubscription: '$(azureServiceConnection)'
@@ -30,18 +30,39 @@ steps:
       set -euo pipefail
 
       echo "========================================="
-      echo "Azure Account Information"
+      echo "Azure Authentication"
       echo "========================================="
 
       az account show \
         --query "{Name:name, Subscription:id, Tenant:tenantId}" \
         --output table
 
+      echo "Azure subscription verified successfully."
+
+
+# ============================================================
+# 2. Install Tools and Connect to AKS
+# ============================================================
+
+- task: AzureCLI@2
+  displayName: 'Install Tools and Connect to AKS'
+
+  inputs:
+    azureSubscription: '$(azureServiceConnection)'
+    scriptType: bash
+    scriptLocation: inlineScript
+
+    inlineScript: |
+
+      set -euo pipefail
+
       echo "========================================="
       echo "Installing kubectl and kubelogin"
       echo "========================================="
 
       az aks install-cli
+
+      export PATH="/usr/local/bin:$PATH"
 
       kubectl version --client
       kubelogin --version
@@ -66,27 +87,73 @@ steps:
       echo "========================================="
 
       kubectl config current-context
+
       kubectl get nodes
+
+      echo "AKS connection successful."
+
+
+# ============================================================
+# 3. Create Production Namespace
+# ============================================================
+
+- task: AzureCLI@2
+  displayName: 'Create Production Namespace'
+
+  inputs:
+    azureSubscription: '$(azureServiceConnection)'
+    scriptType: bash
+    scriptLocation: inlineScript
+
+    inlineScript: |
+
+      set -euo pipefail
 
       echo "========================================="
       echo "Creating production namespace"
       echo "========================================="
 
       kubectl create namespace "$(namespace)" \
-        --dry-run=client -o yaml | kubectl apply -f -
+        --dry-run=client \
+        -o yaml | kubectl apply -f -
+
+      kubectl get namespaces
+
+
+# ============================================================
+# 4. Deploy Kubernetes Manifests
+# ============================================================
+
+- task: AzureCLI@2
+  displayName: 'Deploy Kubernetes Manifests'
+
+  inputs:
+    azureSubscription: '$(azureServiceConnection)'
+    scriptType: bash
+    scriptLocation: inlineScript
+
+    inlineScript: |
+
+      set -euo pipefail
+
+      MANIFEST_DIR="$(System.DefaultWorkingDirectory)/kubernetes"
 
       echo "========================================="
-      echo "Checking Kubernetes manifests"
+      echo "Checking Kubernetes manifest directory"
       echo "========================================="
 
-      ls -la "$(System.DefaultWorkingDirectory)/kubernetes"
+      if [ ! -d "$MANIFEST_DIR" ]; then
+        echo "ERROR: Kubernetes directory not found."
+        exit 1
+      fi
+
+      ls -la "$MANIFEST_DIR"
 
       echo "========================================="
       echo "Applying Kubernetes manifests"
       echo "========================================="
 
-      kubectl apply \
-        -f "$(System.DefaultWorkingDirectory)/kubernetes/"
+      kubectl apply -f "$MANIFEST_DIR/"
 
       echo "========================================="
       echo "Checking deployments"
@@ -112,7 +179,43 @@ steps:
 
       kubectl get hpa -n "$(namespace)" || true
 
+
+# ============================================================
+# 5. Verify Application Deployment
+# ============================================================
+
+- task: AzureCLI@2
+  displayName: 'Verify AKS Application Deployment'
+
+  inputs:
+    azureSubscription: '$(azureServiceConnection)'
+    scriptType: bash
+    scriptLocation: inlineScript
+
+    inlineScript: |
+
+      set -euo pipefail
+
       echo "========================================="
-      echo "AKS deployment completed"
+      echo "Waiting for deployment rollout"
       echo "========================================="
- 
+
+      kubectl rollout status deployment/webapp \
+        -n "$(namespace)" \
+        --timeout=180s
+
+      echo "========================================="
+      echo "Final Kubernetes Resources"
+      echo "========================================="
+
+      kubectl get all -n "$(namespace)"
+
+      echo "========================================="
+      echo "Final Pod Status"
+      echo "========================================="
+
+      kubectl get pods -n "$(namespace)" -o wide
+
+      echo "========================================="
+      echo "AKS Deployment Completed Successfully"
+      echo "========================================="
