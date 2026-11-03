@@ -13,8 +13,10 @@ variables:
   aksClusterName: 'aks-production'
   namespace: 'production'
 
+  # Replace with your existing image
+  dockerHubUsername: 'YOUR_DOCKERHUB_USERNAME'
   dockerImageName: 'webapp'
-  dockerImageTag: '$(Build.BuildId)'
+  dockerImageTag: 'latest'
 
 steps:
 
@@ -40,24 +42,7 @@ steps:
 
 
 # ============================================================
-# 2. Build and Push Docker Image
-# ============================================================
-
-- task: Docker@2
-  displayName: 'Build and Push Docker Image'
-  inputs:
-    containerRegistry: 'DockerHubServiceConnection'
-    repository: '$(dockerHubUsername)/$(dockerImageName)'
-    command: 'buildAndPush'
-    Dockerfile: '$(Build.SourcesDirectory)/app/Dockerfile'
-    buildContext: '$(Build.SourcesDirectory)/app'
-    tags: |
-      $(dockerImageTag)
-      latest
-
-
-# ============================================================
-# 3. Install kubectl and kubelogin
+# 2. Install kubectl and kubelogin
 # ============================================================
 
 - task: AzureCLI@2
@@ -77,6 +62,7 @@ steps:
       export PATH="/usr/local/bin:$PATH"
 
       kubectl version --client
+
       kubelogin --version
 
       echo "Getting AKS credentials"
@@ -90,27 +76,19 @@ steps:
 
       kubelogin convert-kubeconfig -l azurecli
 
-      echo "Testing AKS connection"
+      echo "Checking AKS connection"
 
       kubectl config current-context
 
-      echo "Checking production namespace access"
-
-      kubectl get namespace "$(namespace)"
-
-      kubectl auth can-i get deployments \
-        -n "$(namespace)"
-
-      kubectl auth can-i create deployments \
-        -n "$(namespace)"
+      echo "AKS connection configured successfully"
 
 
 # ============================================================
-# 4. Verify Docker Image
+# 3. Verify Production Namespace and Permissions
 # ============================================================
 
 - task: AzureCLI@2
-  displayName: 'Verify Docker Image'
+  displayName: 'Verify Production Namespace'
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
@@ -119,20 +97,27 @@ steps:
 
       set -euo pipefail
 
-      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
+      echo "Checking production namespace"
 
-      echo "Application Docker Image:"
-      echo "$IMAGE"
+      kubectl get namespace "$(namespace)"
 
-      echo "Docker image build and push completed."
+      echo "Checking deployment permissions"
+
+      kubectl auth can-i get deployments \
+        -n "$(namespace)"
+
+      kubectl auth can-i create deployments \
+        -n "$(namespace)"
+
+      echo "Namespace verification completed"
 
 
 # ============================================================
-# 5. Deploy Kubernetes Manifests
+# 4. Validate Kubernetes Manifests
 # ============================================================
 
 - task: AzureCLI@2
-  displayName: 'Deploy Kubernetes Manifests'
+  displayName: 'Validate Kubernetes Manifests'
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
@@ -143,7 +128,7 @@ steps:
 
       MANIFEST_DIR="$(Build.SourcesDirectory)/kubernetes"
 
-      echo "Checking Kubernetes manifest directory"
+      echo "Checking Kubernetes directory"
 
       if [ ! -d "$MANIFEST_DIR" ]; then
         echo "ERROR: Kubernetes directory not found"
@@ -152,13 +137,47 @@ steps:
 
       ls -la "$MANIFEST_DIR"
 
-      echo "Updating deployment image"
+      echo "Validating deployment manifest"
 
-      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
+      kubectl apply \
+        --dry-run=server \
+        -f "$MANIFEST_DIR/deployment.yaml" \
+        -n "$(namespace)"
 
-      echo "Using image: $IMAGE"
+      echo "Validating service manifest"
 
-      echo "Applying deployment"
+      kubectl apply \
+        --dry-run=server \
+        -f "$MANIFEST_DIR/service.yaml" \
+        -n "$(namespace)"
+
+      echo "Validating HPA manifest"
+
+      kubectl apply \
+        --dry-run=server \
+        -f "$MANIFEST_DIR/hpa.yaml" \
+        -n "$(namespace)"
+
+      echo "Manifest validation successful"
+
+
+# ============================================================
+# 5. Deploy Kubernetes Manifests
+# ============================================================
+
+- task: AzureCLI@2
+  displayName: 'Deploy Kubernetes Application'
+  inputs:
+    azureSubscription: '$(azureServiceConnection)'
+    scriptType: bash
+    scriptLocation: inlineScript
+    inlineScript: |
+
+      set -euo pipefail
+
+      MANIFEST_DIR="$(Build.SourcesDirectory)/kubernetes"
+
+      echo "Deploying application"
 
       kubectl apply \
         -f "$MANIFEST_DIR/deployment.yaml" \
@@ -166,25 +185,29 @@ steps:
 
       echo "Updating application image"
 
+      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
+
       kubectl set image deployment/webapp \
         webapp="$IMAGE" \
         -n "$(namespace)"
 
-      echo "Applying service"
+      echo "Applying Kubernetes service"
 
       kubectl apply \
         -f "$MANIFEST_DIR/service.yaml" \
         -n "$(namespace)"
 
-      echo "Applying HPA"
+      echo "Applying Horizontal Pod Autoscaler"
 
       kubectl apply \
         -f "$MANIFEST_DIR/hpa.yaml" \
         -n "$(namespace)"
 
+      echo "Kubernetes manifests deployed"
+
 
 # ============================================================
-# 6. Verify Application Rollout
+# 6. Verify Application Deployment
 # ============================================================
 
 - task: AzureCLI@2
@@ -197,13 +220,13 @@ steps:
 
       set -euo pipefail
 
-      echo "Waiting for application rollout"
+      echo "Waiting for deployment rollout"
 
       kubectl rollout status deployment/webapp \
         -n "$(namespace)" \
         --timeout=180s
 
-      echo "Checking deployments"
+      echo "Checking deployment"
 
       kubectl get deployments -n "$(namespace)"
 
@@ -219,7 +242,7 @@ steps:
 
       kubectl get hpa -n "$(namespace)"
 
-      echo "Checking all resources"
+      echo "Checking Kubernetes resources"
 
       kubectl get all -n "$(namespace)"
 
