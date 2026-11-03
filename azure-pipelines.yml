@@ -1,3 +1,4 @@
+
 trigger:
   - main
 
@@ -8,67 +9,74 @@ variables:
   azureServiceConnection: 'AzureServiceConnection'
   resourceGroup: 'rg-aks-production'
   aksClusterName: 'aks-production'
+  namespace: 'production'
 
 steps:
 
 # ============================================================
-# 1. Connect to AKS
+# 1. Install tools, authenticate and connect to AKS
 # ============================================================
+
 - task: AzureCLI@2
-  displayName: 'Connect to AKS'
+  displayName: 'Connect to AKS and deploy application'
+
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
+
     inlineScript: |
 
-      set -e
+      set -euo pipefail
 
-      echo "Installing kubectl and kubelogin..."
+      echo "========================================="
+      echo "Azure Account Information"
+      echo "========================================="
+
+      az account show \
+        --query "{Name:name, Subscription:id, Tenant:tenantId}" \
+        --output table
+
+      echo "========================================="
+      echo "Installing kubectl and kubelogin"
+      echo "========================================="
 
       az aks install-cli
 
-      echo "kubectl version:"
       kubectl version --client
-
-      echo "kubelogin version:"
       kubelogin --version
 
-      echo "Getting AKS credentials..."
+      echo "========================================="
+      echo "Getting AKS credentials"
+      echo "========================================="
 
       az aks get-credentials \
         --resource-group "$(resourceGroup)" \
         --name "$(aksClusterName)" \
         --overwrite-existing
 
-      echo "Converting kubeconfig..."
+      echo "========================================="
+      echo "Configuring kubelogin"
+      echo "========================================="
 
       kubelogin convert-kubeconfig -l azurecli
 
-      echo "Current Kubernetes context:"
+      echo "========================================="
+      echo "Testing AKS connection"
+      echo "========================================="
 
       kubectl config current-context
-
-      echo "Testing AKS connection..."
-
       kubectl get nodes
 
+      echo "========================================="
+      echo "Creating production namespace"
+      echo "========================================="
 
-# ============================================================
-# 2. Deploy Kubernetes manifests
-# ============================================================
-- task: AzureCLI@2
-  displayName: 'Deploy Kubernetes manifests'
-  inputs:
-    azureSubscription: '$(azureServiceConnection)'
-    scriptType: bash
-    scriptLocation: inlineScript
-    inlineScript: |
-
-      set -e
+      kubectl create namespace "$(namespace)" \
+        --dry-run=client -o yaml | kubectl apply -f -
 
       echo "========================================="
-      echo "Kubernetes manifest files"
+      echo "Checking Kubernetes manifests"
       echo "========================================="
 
       ls -la "$(System.DefaultWorkingDirectory)/kubernetes"
@@ -81,25 +89,29 @@ steps:
         -f "$(System.DefaultWorkingDirectory)/kubernetes/"
 
       echo "========================================="
-      echo "Kubernetes resources"
+      echo "Checking deployments"
       echo "========================================="
 
-      kubectl get all -n production
+      kubectl get deployments -n "$(namespace)"
 
       echo "========================================="
-      echo "Deployments"
+      echo "Checking pods"
       echo "========================================="
 
-      kubectl get deployments -n production
+      kubectl get pods -n "$(namespace)"
 
       echo "========================================="
-      echo "Pods"
+      echo "Checking services"
       echo "========================================="
 
-      kubectl get pods -n production
+      kubectl get services -n "$(namespace)"
 
       echo "========================================="
-      echo "Services"
+      echo "Checking HPA"
       echo "========================================="
 
-      kubectl get services -n production
+      kubectl get hpa -n "$(namespace)" || true
+
+      echo "========================================="
+      echo "AKS deployment completed"
+      echo "========================================="
