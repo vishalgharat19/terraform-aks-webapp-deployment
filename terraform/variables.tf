@@ -44,12 +44,15 @@ variable "admin_principal_ids" {
 }
 
 variable "node_vm_size" {
-  type    = string
-  default = "Standard_D2s_v5"
+  description = "Azure VM size for AKS nodes."
+  type        = string
+  default     = "Standard_B2s"
 }
 
 variable "tags" {
-  type = map(string)
+  description = "Common tags applied to Azure resources."
+  type        = map(string)
+
   default = {
     Environment = "Production"
     ManagedBy   = "Terraform"
