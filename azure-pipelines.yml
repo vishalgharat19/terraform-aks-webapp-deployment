@@ -12,11 +12,7 @@ variables:
   resourceGroup: 'rg-aks-production'
   aksClusterName: 'aks-production'
   namespace: 'production'
-
-  # Replace with your existing image
-  dockerHubUsername: 'YOUR_DOCKERHUB_USERNAME'
-  dockerImageName: 'webapp'
-  dockerImageTag: 'latest'
+  deploymentName: 'webapp'
 
 steps:
 
@@ -31,18 +27,21 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
 
-      echo "Verifying Azure authentication"
+      echo "========================================="
+      echo "Azure Authentication"
+      echo "========================================="
 
-      az account show --output table
+      az account show \
+        --query "{Name:name, Subscription:id, Tenant:tenantId}" \
+        --output table
 
-      echo "Azure authentication successful"
+      echo "Azure authentication successful."
 
 
 # ============================================================
-# 2. Install kubectl and kubelogin
+# 2. Install Tools and Connect to AKS
 # ============================================================
 
 - task: AzureCLI@2
@@ -52,35 +51,37 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
 
+      echo "========================================="
       echo "Installing kubectl and kubelogin"
+      echo "========================================="
 
       az aks install-cli
 
       export PATH="/usr/local/bin:$PATH"
 
       kubectl version --client
-
       kubelogin --version
 
+      echo "========================================="
       echo "Getting AKS credentials"
+      echo "========================================="
 
       az aks get-credentials \
         --resource-group "$(resourceGroup)" \
         --name "$(aksClusterName)" \
         --overwrite-existing
 
-      echo "Configuring kubelogin"
-
       kubelogin convert-kubeconfig -l azurecli
 
-      echo "Checking AKS connection"
+      echo "========================================="
+      echo "Testing AKS connection"
+      echo "========================================="
 
       kubectl config current-context
 
-      echo "AKS connection configured successfully"
+      echo "AKS credentials configured successfully."
 
 
 # ============================================================
@@ -94,22 +95,27 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
+
+      NAMESPACE="$(namespace)"
 
       echo "Checking production namespace"
 
-      kubectl get namespace "$(namespace)"
+      kubectl get namespace "$NAMESPACE"
 
-      echo "Checking deployment permissions"
+      echo "Checking Kubernetes permissions"
 
-      kubectl auth can-i get deployments \
-        -n "$(namespace)"
+      kubectl auth can-i get deployments -n "$NAMESPACE"
+      kubectl auth can-i create deployments -n "$NAMESPACE"
+      kubectl auth can-i patch deployments -n "$NAMESPACE"
+      kubectl auth can-i get pods -n "$NAMESPACE"
+      kubectl auth can-i list pods -n "$NAMESPACE"
+      kubectl auth can-i get services -n "$NAMESPACE"
+      kubectl auth can-i create services -n "$NAMESPACE"
+      kubectl auth can-i get horizontalpodautoscalers -n "$NAMESPACE"
+      kubectl auth can-i create horizontalpodautoscalers -n "$NAMESPACE"
 
-      kubectl auth can-i create deployments \
-        -n "$(namespace)"
-
-      echo "Namespace verification completed"
+      echo "Production namespace verification completed."
 
 
 # ============================================================
@@ -123,17 +129,24 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
 
       MANIFEST_DIR="$(Build.SourcesDirectory)/kubernetes"
+      NAMESPACE="$(namespace)"
 
-      echo "Checking Kubernetes directory"
+      echo "Checking manifest directory"
 
       if [ ! -d "$MANIFEST_DIR" ]; then
-        echo "ERROR: Kubernetes directory not found"
+        echo "ERROR: Kubernetes directory not found."
         exit 1
       fi
+
+      for FILE in deployment.yaml service.yaml hpa.yaml; do
+        if [ ! -f "$MANIFEST_DIR/$FILE" ]; then
+          echo "ERROR: Missing manifest: $FILE"
+          exit 1
+        fi
+      done
 
       ls -la "$MANIFEST_DIR"
 
@@ -142,23 +155,23 @@ steps:
       kubectl apply \
         --dry-run=server \
         -f "$MANIFEST_DIR/deployment.yaml" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
       echo "Validating service manifest"
 
       kubectl apply \
         --dry-run=server \
         -f "$MANIFEST_DIR/service.yaml" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
       echo "Validating HPA manifest"
 
       kubectl apply \
         --dry-run=server \
         -f "$MANIFEST_DIR/hpa.yaml" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
-      echo "Manifest validation successful"
+      echo "All Kubernetes manifests validated successfully."
 
 
 # ============================================================
@@ -172,42 +185,47 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
 
       MANIFEST_DIR="$(Build.SourcesDirectory)/kubernetes"
+      NAMESPACE="$(namespace)"
 
-      echo "Deploying application"
+      echo "========================================="
+      echo "Deploying Kubernetes Application"
+      echo "========================================="
+
+      echo "Applying application deployment"
 
       kubectl apply \
         -f "$MANIFEST_DIR/deployment.yaml" \
-        -n "$(namespace)"
-
-      echo "Updating application image"
-
-      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
-
-      kubectl set image deployment/webapp \
-        webapp="$IMAGE" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
       echo "Applying Kubernetes service"
 
       kubectl apply \
         -f "$MANIFEST_DIR/service.yaml" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
       echo "Applying Horizontal Pod Autoscaler"
 
       kubectl apply \
         -f "$MANIFEST_DIR/hpa.yaml" \
-        -n "$(namespace)"
+        -n "$NAMESPACE"
 
-      echo "Kubernetes manifests deployed"
+      echo "========================================="
+      echo "Checking deployed resources"
+      echo "========================================="
+
+      kubectl get deployments -n "$NAMESPACE"
+      kubectl get pods -n "$NAMESPACE"
+      kubectl get services -n "$NAMESPACE"
+      kubectl get hpa -n "$NAMESPACE"
+
+      echo "Kubernetes manifests applied successfully."
 
 
 # ============================================================
-# 6. Verify Application Deployment
+# 6. Verify AKS Deployment and Collect Diagnostics
 # ============================================================
 
 - task: AzureCLI@2
@@ -217,33 +235,79 @@ steps:
     scriptType: bash
     scriptLocation: inlineScript
     inlineScript: |
-
       set -euo pipefail
 
+      NAMESPACE="$(namespace)"
+      DEPLOYMENT="$(deploymentName)"
+
+      echo "========================================="
+      echo "Checking deployment image"
+      echo "========================================="
+
+      kubectl get deployment "$DEPLOYMENT" \
+        -n "$NAMESPACE" \
+        -o jsonpath='{.spec.template.spec.containers[*].image}'
+
+      echo
+
+      echo "========================================="
       echo "Waiting for deployment rollout"
+      echo "========================================="
 
-      kubectl rollout status deployment/webapp \
-        -n "$(namespace)" \
-        --timeout=180s
+      if ! kubectl rollout status \
+        "deployment/$DEPLOYMENT" \
+        -n "$NAMESPACE" \
+        --timeout=300s; then
 
-      echo "Checking deployment"
+        echo "ERROR: Deployment rollout failed."
 
-      kubectl get deployments -n "$(namespace)"
+        echo "========================================="
+        echo "Deployment Details"
+        echo "========================================="
 
-      echo "Checking pods"
+        kubectl describe deployment "$DEPLOYMENT" \
+          -n "$NAMESPACE" || true
 
-      kubectl get pods -n "$(namespace)" -o wide
+        echo "========================================="
+        echo "ReplicaSets"
+        echo "========================================="
 
-      echo "Checking services"
+        kubectl get replicasets -n "$NAMESPACE" || true
 
-      kubectl get services -n "$(namespace)"
+        echo "========================================="
+        echo "Pod Status"
+        echo "========================================="
 
-      echo "Checking HPA"
+        kubectl get pods -n "$NAMESPACE" -o wide || true
 
-      kubectl get hpa -n "$(namespace)"
+        echo "========================================="
+        echo "Pod Details"
+        echo "========================================="
 
-      echo "Checking Kubernetes resources"
+        kubectl describe pods -n "$NAMESPACE" || true
 
-      kubectl get all -n "$(namespace)"
+        echo "========================================="
+        echo "Kubernetes Events"
+        echo "========================================="
 
-      echo "AKS deployment completed successfully"
+        kubectl get events -n "$NAMESPACE" \
+          --sort-by='.metadata.creationTimestamp' || true
+
+        exit 1
+      fi
+
+      echo "========================================="
+      echo "Deployment Successful"
+      echo "========================================="
+
+      kubectl get deployments -n "$NAMESPACE"
+
+      kubectl get pods -n "$NAMESPACE" -o wide
+
+      kubectl get services -n "$NAMESPACE"
+
+      kubectl get hpa -n "$NAMESPACE"
+
+      echo "========================================="
+      echo "AKS Deployment Completed Successfully"
+      echo "========================================="
