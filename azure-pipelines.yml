@@ -1,6 +1,8 @@
 
 trigger:
-  - main
+  branches:
+    include:
+      - main
 
 pool:
   vmImage: 'ubuntu-latest'
@@ -11,54 +13,64 @@ variables:
   aksClusterName: 'aks-production'
   namespace: 'production'
 
+  dockerImageName: 'webapp'
+  dockerImageTag: '$(Build.BuildId)'
+
 steps:
 
 # ============================================================
-# 1. Verify Azure Authentication and Subscription
+# 1. Verify Azure Authentication
 # ============================================================
 
 - task: AzureCLI@2
   displayName: 'Verify Azure Authentication'
-
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
-
     inlineScript: |
 
       set -euo pipefail
 
-      echo "========================================="
-      echo "Azure Authentication"
-      echo "========================================="
+      echo "Verifying Azure authentication"
 
-      az account show \
-        --query "{Name:name, Subscription:id, Tenant:tenantId}" \
-        --output table
+      az account show --output table
 
-      echo "Azure subscription verified successfully."
+      echo "Azure authentication successful"
 
 
 # ============================================================
-# 2. Install Tools and Connect to AKS
+# 2. Build and Push Docker Image
+# ============================================================
+
+- task: Docker@2
+  displayName: 'Build and Push Docker Image'
+  inputs:
+    containerRegistry: 'DockerHubServiceConnection'
+    repository: '$(dockerHubUsername)/$(dockerImageName)'
+    command: 'buildAndPush'
+    Dockerfile: '$(Build.SourcesDirectory)/app/Dockerfile'
+    buildContext: '$(Build.SourcesDirectory)/app'
+    tags: |
+      $(dockerImageTag)
+      latest
+
+
+# ============================================================
+# 3. Install kubectl and kubelogin
 # ============================================================
 
 - task: AzureCLI@2
   displayName: 'Install Tools and Connect to AKS'
-
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
-
     inlineScript: |
 
       set -euo pipefail
 
-      echo "========================================="
       echo "Installing kubectl and kubelogin"
-      echo "========================================="
 
       az aks install-cli
 
@@ -67,155 +79,148 @@ steps:
       kubectl version --client
       kubelogin --version
 
-      echo "========================================="
       echo "Getting AKS credentials"
-      echo "========================================="
 
       az aks get-credentials \
         --resource-group "$(resourceGroup)" \
         --name "$(aksClusterName)" \
         --overwrite-existing
 
-      echo "========================================="
       echo "Configuring kubelogin"
-      echo "========================================="
 
       kubelogin convert-kubeconfig -l azurecli
 
-      echo "========================================="
       echo "Testing AKS connection"
-      echo "========================================="
 
       kubectl config current-context
 
-      kubectl get nodes
+      echo "Checking production namespace access"
 
-      echo "AKS connection successful."
+      kubectl get namespace "$(namespace)"
+
+      kubectl auth can-i get deployments \
+        -n "$(namespace)"
+
+      kubectl auth can-i create deployments \
+        -n "$(namespace)"
 
 
 # ============================================================
-# 3. Create Production Namespace
+# 4. Verify Docker Image
 # ============================================================
 
 - task: AzureCLI@2
-  displayName: 'Create Production Namespace'
-
+  displayName: 'Verify Docker Image'
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
-
     inlineScript: |
 
       set -euo pipefail
 
-      echo "========================================="
-      echo "Creating production namespace"
-      echo "========================================="
+      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
 
-      kubectl create namespace "$(namespace)" \
-        --dry-run=client \
-        -o yaml | kubectl apply -f -
+      echo "Application Docker Image:"
+      echo "$IMAGE"
 
-      kubectl get namespaces
+      echo "Docker image build and push completed."
 
 
 # ============================================================
-# 4. Deploy Kubernetes Manifests
+# 5. Deploy Kubernetes Manifests
 # ============================================================
 
 - task: AzureCLI@2
   displayName: 'Deploy Kubernetes Manifests'
-
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
-
     inlineScript: |
 
       set -euo pipefail
 
-      MANIFEST_DIR="$(System.DefaultWorkingDirectory)/kubernetes"
+      MANIFEST_DIR="$(Build.SourcesDirectory)/kubernetes"
 
-      echo "========================================="
       echo "Checking Kubernetes manifest directory"
-      echo "========================================="
 
       if [ ! -d "$MANIFEST_DIR" ]; then
-        echo "ERROR: Kubernetes directory not found."
+        echo "ERROR: Kubernetes directory not found"
         exit 1
       fi
 
       ls -la "$MANIFEST_DIR"
 
-      echo "========================================="
-      echo "Applying Kubernetes manifests"
-      echo "========================================="
+      echo "Updating deployment image"
 
-      kubectl apply -f "$MANIFEST_DIR/"
+      IMAGE="$(dockerHubUsername)/$(dockerImageName):$(dockerImageTag)"
 
-      echo "========================================="
-      echo "Checking deployments"
-      echo "========================================="
+      echo "Using image: $IMAGE"
 
-      kubectl get deployments -n "$(namespace)"
+      echo "Applying deployment"
 
-      echo "========================================="
-      echo "Checking pods"
-      echo "========================================="
+      kubectl apply \
+        -f "$MANIFEST_DIR/deployment.yaml" \
+        -n "$(namespace)"
 
-      kubectl get pods -n "$(namespace)"
+      echo "Updating application image"
 
-      echo "========================================="
-      echo "Checking services"
-      echo "========================================="
+      kubectl set image deployment/webapp \
+        webapp="$IMAGE" \
+        -n "$(namespace)"
 
-      kubectl get services -n "$(namespace)"
+      echo "Applying service"
 
-      echo "========================================="
-      echo "Checking HPA"
-      echo "========================================="
+      kubectl apply \
+        -f "$MANIFEST_DIR/service.yaml" \
+        -n "$(namespace)"
 
-      kubectl get hpa -n "$(namespace)" || true
+      echo "Applying HPA"
+
+      kubectl apply \
+        -f "$MANIFEST_DIR/hpa.yaml" \
+        -n "$(namespace)"
 
 
 # ============================================================
-# 5. Verify Application Deployment
+# 6. Verify Application Rollout
 # ============================================================
 
 - task: AzureCLI@2
-  displayName: 'Verify AKS Application Deployment'
-
+  displayName: 'Verify AKS Deployment'
   inputs:
     azureSubscription: '$(azureServiceConnection)'
     scriptType: bash
     scriptLocation: inlineScript
-
     inlineScript: |
 
       set -euo pipefail
 
-      echo "========================================="
-      echo "Waiting for deployment rollout"
-      echo "========================================="
+      echo "Waiting for application rollout"
 
       kubectl rollout status deployment/webapp \
         -n "$(namespace)" \
         --timeout=180s
 
-      echo "========================================="
-      echo "Final Kubernetes Resources"
-      echo "========================================="
+      echo "Checking deployments"
 
-      kubectl get all -n "$(namespace)"
+      kubectl get deployments -n "$(namespace)"
 
-      echo "========================================="
-      echo "Final Pod Status"
-      echo "========================================="
+      echo "Checking pods"
 
       kubectl get pods -n "$(namespace)" -o wide
 
-      echo "========================================="
-      echo "AKS Deployment Completed Successfully"
-      echo "========================================="
+      echo "Checking services"
+
+      kubectl get services -n "$(namespace)"
+
+      echo "Checking HPA"
+
+      kubectl get hpa -n "$(namespace)"
+
+      echo "Checking all resources"
+
+      kubectl get all -n "$(namespace)"
+
+      echo "AKS deployment completed successfully"
